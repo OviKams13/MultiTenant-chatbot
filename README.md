@@ -1,1 +1,1 @@
-# MultiTenant-chat
+# MultiTenant-Chat-Hub
