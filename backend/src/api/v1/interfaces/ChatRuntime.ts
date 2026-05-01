@@ -1,9 +1,8 @@
-import { KnowledgeItem } from './KnowledgeItem';
+// Chat runtime interfaces define the public contract used by the visitor-facing chat endpoint.
+// The endpoint accepts either chatbotId (dashboard/internal mode) or domain (widget/external mode).
+// History stays optional and is treated as previous conversation context, not as system instructions.
+// DTOs here keep controller, validation, and service layers aligned under strict TypeScript mode.
 
-// Chat runtime interfaces define the visitor-facing contract shared across validation, controller, and service layers.
-// The public endpoint supports both widget mode (domain) and dashboard mode (chatbotId) in the same payload.
-// History messages are accepted only as user/assistant turns and are never treated as trusted system instructions.
-// Result and source item types are stabilized early so upcoming runtime features can evolve without breaking controllers.
 export type ChatHistoryRole = 'user' | 'assistant';
 
 export interface ChatHistoryMessage {
@@ -11,7 +10,7 @@ export interface ChatHistoryMessage {
   content: string;
 }
 
-export interface ChatRuntimeInput {
+export interface ChatRuntimeRequestPayload {
   chatbotId?: number;
   domain?: string;
   message: string;
@@ -20,19 +19,11 @@ export interface ChatRuntimeInput {
 
 export interface ChatRuntimeSourceItem {
   entity_id: number;
-  entity_type: 'CONTACT' | 'SCHEDULE' | 'DYNAMIC';
+  entity_type: string;
   tags: string[];
 }
 
-export interface ChatRuntimeResult {
+export interface ChatRuntimeResponseDTO {
   answer: string;
   sourceItems: ChatRuntimeSourceItem[];
 }
-
-// Raw context is returned by service internals before ranking/limiting in the next runtime feature.
-export type ChatRuntimeRawContext = KnowledgeItem[];
-
-// Backward-compatible aliases keep existing imports operational while feature 8 contracts converge.
-export type ChatRuntimeRequestBody = ChatRuntimeInput;
-export type ChatRuntimeRequestPayload = ChatRuntimeInput;
-export type ChatRuntimeResponseDTO = ChatRuntimeResult;

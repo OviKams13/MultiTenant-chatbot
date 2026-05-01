@@ -1,30 +1,26 @@
 import { NextFunction, Request, Response } from 'express';
-import { ChatRuntimeRequestBody } from '../interfaces/ChatRuntime';
+import { AppError } from '../errors/AppError';
+import { ChatRuntimeRequestPayload } from '../interfaces/ChatRuntime';
 import { ChatRuntimeService } from '../services/ChatRuntimeService';
 
-// ChatRuntimeController remains intentionally thin and only bridges validated HTTP payloads to service logic.
-// Validation middleware already normalized req.body, so this layer avoids duplicate input checks.
-// Business concerns (tenant resolution, tag classification, context retrieval, LLM calls) belong to service layer.
-// Errors are delegated to errorHandler through next(err) to preserve a single API error envelope policy.
+const chatRuntimeService = new ChatRuntimeService();
+
+// ChatRuntimeController is intentionally thin and only coordinates validated HTTP payloads.
+// The route is public, so this controller never expects authenticated req.user context.
+// Validation middleware injects a trusted payload onto req to avoid duplicate parsing logic here.
+// Errors are passed to global errorHandler so public and private endpoints share one response contract.
 export const ChatRuntimeController = {
-  // handleChat forwards normalized runtime input to ChatRuntimeService and returns standard success structure.
   async handleChat(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { chatbotId, domain, message, history } = req.body as ChatRuntimeRequestBody;
+      const payload = (req as Request & { chatRuntimePayload?: ChatRuntimeRequestPayload }).chatRuntimePayload;
+      if (!payload) {
+        throw new AppError('Chat payload is missing', 400, 'VALIDATION_ERROR');
+      }
 
-      const result = await ChatRuntimeService.chat({
-        chatbotId,
-        domain,
-        message,
-        history
-      });
-
+      const result = await chatRuntimeService.handleChat(payload);
       res.status(200).json({
         success: true,
-        data: {
-          answer: result.answer,
-          sourceItems: result.sourceItems
-        },
+        data: result,
         error: null
       });
     } catch (error) {

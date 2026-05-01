@@ -1,8 +1,6 @@
 import { Op } from 'sequelize';
-import { MAX_CONTEXT_ITEMS } from '../../../config/constants';
 import { AppError } from '../errors/AppError';
-import { ChatRuntimeInput, ChatRuntimeResult } from '../interfaces/ChatRuntime';
-import { KnowledgeItem, KnowledgeItemKind } from '../interfaces/KnowledgeItem';
+import { ChatRuntimeRequestPayload, ChatRuntimeResponseDTO, ChatRuntimeSourceItem } from '../interfaces/ChatRuntime';
 import { BbContactModel } from '../models/BbContactModel';
 import { BbEntityModel } from '../models/BbEntityModel';
 import { BbScheduleModel } from '../models/BbScheduleModel';
@@ -11,338 +9,166 @@ import { ChatbotItemModel } from '../models/ChatbotItemModel';
 import { ChatbotItemTagModel } from '../models/ChatbotItemTagModel';
 import { ChatbotModel } from '../models/ChatbotModel';
 import { TagModel } from '../models/TagModel';
-import { TagService } from './TagService';
 
-interface ResolvedChatbotContext {
-  chatbotId: number;
-  displayName: string;
-}
-
-interface RawItemRef {
-  itemId: number;
+interface ContextItem {
   entityId: number;
+  entityType: string;
+  tags: string[];
+  payload: Record<string, unknown>;
 }
 
-// ChatRuntimeService owns public-chat orchestration and keeps HTTP/controller layers business-agnostic.
-// Feature 8.5 added tenant-scoped batch retrieval to build KnowledgeItem[] without N+1 queries.
-// Feature 8.6 adds deterministic ranking + trimming so context stays inside LLM window budgets.
-// Final LLM response generation is still deferred to Feature 8.7; this service prepares selected context now.
+// ChatRuntimeService orchestrates the public runtime flow for visitor questions.
+// It resolves chatbot scope by chatbotId/domain, loads tenant-owned context blocks, and builds a safe answer payload.
+// In v1 we keep answer generation deterministic and server-controlled to avoid trusting user-provided history.
+// Source items are returned so frontend/debug tooling can explain where the response context came from.
 export class ChatRuntimeService {
-  // chat resolves tenant scope, classifies user intent, fetches knowledge, selects context, and returns source attribution.
-  static async chat(input: ChatRuntimeInput): Promise<ChatRuntimeResult> {
-    const { chatbotId, displayName } = await this.resolveChatbot(input);
-    const queryTags = await TagService.classifyQuestion(input.message);
+  async handleChat(payload: ChatRuntimeRequestPayload): Promise<ChatRuntimeResponseDTO> {
+    const chatbot = await this.resolveChatbot(payload);
+    const contextItems = await this.loadContextItems(Number(chatbot.chatbot_id));
 
-    if (queryTags.length === 0) {
-      throw new AppError('No relevant tags for this question', 400, 'NO_RELEVANT_TAG');
-    }
+    const answer = this.composeAnswer(chatbot.display_name, payload.message, payload.history ?? [], contextItems);
 
-    const knowledgeItems = await this.fetchKnowledgeItems(chatbotId, queryTags);
-    const selectedItems = this.selectContextItems(knowledgeItems);
-    const contextText = this.buildContextText(selectedItems);
-
-    // contextText will be passed to LLMService.askGemini in Feature 8.7 with message/history/chatbot metadata.
-    // Placeholder answer is kept for now while proving selectedItems/sourceItems are context-window safe.
-    void contextText;
     return {
-      answer: `Chat runtime pipeline not fully implemented yet for ${displayName} (chatbot ${chatbotId}).`,
-      sourceItems: selectedItems.map((item) => ({
+      answer,
+      sourceItems: contextItems.map((item) => ({
         entity_id: item.entityId,
-        entity_type: item.kind,
-        tags: queryTags
+        entity_type: item.entityType,
+        tags: item.tags
       }))
     };
   }
 
-  // handleChat remains as compatibility alias while existing callers migrate to chat(...).
-  static async handleChat(input: ChatRuntimeInput): Promise<ChatRuntimeResult> {
-    return this.chat(input);
-  }
+  private async resolveChatbot(payload: ChatRuntimeRequestPayload): Promise<ChatbotModel> {
+    if (payload.chatbotId) {
+      const chatbot = await ChatbotModel.findByPk(payload.chatbotId);
+      if (!chatbot) {
+        throw new AppError('Chatbot not found', 404, 'CHATBOT_NOT_FOUND');
+      }
 
-  // fetchKnowledgeItems retrieves all tenant-scoped entities matching query tags using batched table reads.
-  // The method intentionally returns the full raw set; selection/ranking is performed later in selectContextItems.
-  private static async fetchKnowledgeItems(chatbotId: number, queryTags: string[]): Promise<KnowledgeItem[]> {
-    const tagLinks = await ChatbotItemTagModel.findAll({
-      attributes: ['item_id'],
-      include: [
-        {
-          model: TagModel,
-          as: 'tag',
-          attributes: ['tag_id', 'tag_code'],
-          where: {
-            tag_code: {
-              [Op.in]: queryTags
-            }
-          },
-          required: true
-        },
-        {
-          model: ChatbotItemModel,
-          as: 'item',
-          attributes: ['item_id', 'entity_id'],
-          where: { chatbot_id: chatbotId },
-          required: true
-        }
-      ]
+      return chatbot;
+    }
+
+    const chatbot = await ChatbotModel.findOne({
+      where: { domain: payload.domain }
     });
-
-    const rawItemRefs: RawItemRef[] = [];
-    for (const link of tagLinks as Array<ChatbotItemTagModel & { item?: { item_id: number; entity_id: number } }>) {
-      if (link.item) {
-        rawItemRefs.push({ itemId: Number(link.item.item_id), entityId: Number(link.item.entity_id) });
-      }
-    }
-
-    const orderedEntityIds: number[] = [];
-    const seenEntityIds = new Set<number>();
-    for (const ref of rawItemRefs) {
-      if (!seenEntityIds.has(ref.entityId)) {
-        seenEntityIds.add(ref.entityId);
-        orderedEntityIds.push(ref.entityId);
-      }
-    }
-
-    // Empty retrieval is a valid state; downstream policy decides how to answer with zero context.
-    if (orderedEntityIds.length === 0) {
-      return [];
-    }
-
-    const entities = await BbEntityModel.findAll({
-      where: {
-        entity_id: {
-          [Op.in]: orderedEntityIds
-        }
-      }
-    });
-
-    const entityById = new Map<number, BbEntityModel>();
-    for (const entity of entities) {
-      entityById.set(Number(entity.entity_id), entity);
-    }
-
-    const contactEntityIds: number[] = [];
-    const scheduleEntityIds: number[] = [];
-    const dynamicTypeIds = new Set<number>();
-
-    for (const entityId of orderedEntityIds) {
-      const entity = entityById.get(entityId);
-      if (!entity) {
-        continue;
-      }
-
-      if (entity.entity_type === 'CONTACT') {
-        contactEntityIds.push(entityId);
-      }
-
-      if (entity.entity_type === 'SCHEDULE') {
-        scheduleEntityIds.push(entityId);
-      }
-
-      if (typeof entity.type_id === 'number') {
-        dynamicTypeIds.add(Number(entity.type_id));
-      }
-    }
-
-    const contacts =
-      contactEntityIds.length > 0
-        ? await BbContactModel.findAll({
-            where: {
-              entity_id: {
-                [Op.in]: contactEntityIds
-              }
-            }
-          })
-        : [];
-
-    const schedules =
-      scheduleEntityIds.length > 0
-        ? await BbScheduleModel.findAll({
-            where: {
-              entity_id: {
-                [Op.in]: scheduleEntityIds
-              }
-            }
-          })
-        : [];
-
-    const blockTypes =
-      dynamicTypeIds.size > 0
-        ? await BlockTypeModel.findAll({
-            where: {
-              type_id: {
-                [Op.in]: Array.from(dynamicTypeIds)
-              }
-            },
-            attributes: ['type_id', 'type_name']
-          })
-        : [];
-
-    const contactByEntityId = new Map<number, BbContactModel>();
-    for (const contact of contacts) {
-      contactByEntityId.set(Number(contact.entity_id), contact);
-    }
-
-    const schedulesByEntityId = new Map<number, BbScheduleModel[]>();
-    for (const schedule of schedules) {
-      const key = Number(schedule.entity_id);
-      const rows = schedulesByEntityId.get(key) ?? [];
-      rows.push(schedule);
-      schedulesByEntityId.set(key, rows);
-    }
-
-    const blockTypeById = new Map<number, BlockTypeModel>();
-    for (const blockType of blockTypes) {
-      blockTypeById.set(Number(blockType.type_id), blockType);
-    }
-
-    const knowledgeItems: KnowledgeItem[] = [];
-    for (const entityId of orderedEntityIds) {
-      const entity = entityById.get(entityId);
-      if (!entity) {
-        continue;
-      }
-
-      if (entity.entity_type === 'CONTACT') {
-        const contact = contactByEntityId.get(entityId);
-        if (!contact) {
-          continue;
-        }
-
-        knowledgeItems.push({
-          kind: 'CONTACT',
-          entityId,
-          createdAt: entity.created_at,
-          contact: this.toPlainRecord(contact)
-        });
-        continue;
-      }
-
-      if (entity.entity_type === 'SCHEDULE') {
-        const groupedSchedules = schedulesByEntityId.get(entityId) ?? [];
-        knowledgeItems.push({
-          kind: 'SCHEDULE',
-          entityId,
-          createdAt: entity.created_at,
-          schedules: groupedSchedules.map((schedule) => this.toPlainRecord(schedule))
-        });
-        continue;
-      }
-
-      if (typeof entity.type_id === 'number') {
-        const blockType = blockTypeById.get(Number(entity.type_id));
-        knowledgeItems.push({
-          kind: 'DYNAMIC',
-          entityId,
-          createdAt: entity.created_at,
-          typeId: Number(entity.type_id),
-          typeName: blockType?.type_name ?? 'UNKNOWN_TYPE',
-          data: this.normalizeDynamicData(entity.data)
-        });
-      }
-    }
-
-    return knowledgeItems;
-  }
-
-  // getKindPriority enforces strict business precedence: CONTACT first, then SCHEDULE, then DYNAMIC.
-  // This is intentionally non-proportional: once the limit is hit, lower-priority kinds are sacrificed first.
-  private static getKindPriority(kind: KnowledgeItemKind): number {
-    if (kind === 'CONTACT') return 1;
-    if (kind === 'SCHEDULE') return 2;
-    return 3;
-  }
-
-  // selectContextItems applies deterministic ordering and trims to MAX_CONTEXT_ITEMS.
-  // Sorting policy: kind priority ASC, createdAt DESC, then entityId ASC for stable tie-breaking.
-  // When CONTACT + SCHEDULE already fill the window, DYNAMIC items are fully excluded by design.
-  private static selectContextItems(allItems: KnowledgeItem[]): KnowledgeItem[] {
-    const sortedItems = [...allItems].sort((a, b) => {
-      const priorityDiff = this.getKindPriority(a.kind) - this.getKindPriority(b.kind);
-      if (priorityDiff !== 0) {
-        return priorityDiff;
-      }
-
-      const createdAtDiff = b.createdAt.getTime() - a.createdAt.getTime();
-      if (createdAtDiff !== 0) {
-        return createdAtDiff;
-      }
-
-      return a.entityId - b.entityId;
-    });
-
-    return sortedItems.slice(0, MAX_CONTEXT_ITEMS);
-  }
-
-  // buildContextText converts selected items into deterministic plain text consumed by future LLM prompts.
-  // The output mirrors selectedItems order so source attribution and prompt context stay aligned.
-  // Each section is prefixed by kind labels to reduce ambiguity when Gemini receives mixed data types.
-  private static buildContextText(selectedItems: KnowledgeItem[]): string {
-    const lines: string[] = ['Chatbot knowledge context:'];
-
-    for (const item of selectedItems) {
-      if (item.kind === 'CONTACT') {
-        lines.push(`CONTACT (entityId=${item.entityId}):`);
-        for (const [key, value] of Object.entries(item.contact)) {
-          lines.push(`  ${key}: ${String(value)}`);
-        }
-        continue;
-      }
-
-      if (item.kind === 'SCHEDULE') {
-        lines.push(`SCHEDULE (entityId=${item.entityId}):`);
-        for (const row of item.schedules) {
-          const day = String(row.day_of_week ?? row.day ?? 'UNKNOWN_DAY');
-          const open = String(row.open_time ?? row.open ?? 'N/A');
-          const close = String(row.close_time ?? row.close ?? 'N/A');
-          lines.push(`  day: ${day}, open: ${open}, close: ${close}`);
-        }
-        continue;
-      }
-
-      lines.push(`DYNAMIC (entityId=${item.entityId}, type=${item.typeName}):`);
-      lines.push(`  data: ${JSON.stringify(item.data)}`);
-    }
-
-    return lines.join('\n');
-  }
-
-  // resolveChatbot enforces the multi-tenant boundary: all downstream queries must use this resolved chatbotId.
-  private static async resolveChatbot(input: ChatRuntimeInput): Promise<ResolvedChatbotContext> {
-    let chatbot: ChatbotModel | null = null;
-
-    if (typeof input.chatbotId === 'number') {
-      chatbot = await ChatbotModel.findByPk(input.chatbotId);
-    } else if (input.domain) {
-      chatbot = await ChatbotModel.findOne({ where: { domain: input.domain } });
-    } else {
-      throw new AppError('chatbotId or domain is required', 400, 'VALIDATION_ERROR');
-    }
 
     if (!chatbot) {
-      throw new AppError('Chatbot not found', 404, 'CHATBOT_NOT_FOUND');
+      throw new AppError('Chatbot not found for this domain', 404, 'CHATBOT_NOT_FOUND');
     }
 
-    return {
-      chatbotId: Number(chatbot.chatbot_id),
-      displayName: chatbot.display_name
-    };
+    return chatbot;
   }
 
-  // toPlainRecord converts Sequelize instances into serializable plain objects for context payload safety.
-  private static toPlainRecord<T extends { toJSON?: () => object }>(row: T): Record<string, unknown> {
-    if (typeof row.toJSON === 'function') {
-      return row.toJSON() as Record<string, unknown>;
+  private async loadContextItems(chatbotId: number): Promise<ContextItem[]> {
+    const items = await ChatbotItemModel.findAll({
+      where: { chatbot_id: chatbotId },
+      order: [['created_at', 'DESC']]
+    });
+
+    const context: ContextItem[] = [];
+    for (const item of items) {
+      const entity = await BbEntityModel.findByPk(item.entity_id);
+      if (!entity) {
+        continue;
+      }
+
+      const tags = await this.findTagsForItem(Number(item.item_id));
+      const contextItem = await this.hydrateContextEntity(Number(entity.entity_id), entity, tags);
+      if (contextItem) {
+        context.push(contextItem);
+      }
     }
 
-    return { ...(row as unknown as Record<string, unknown>) };
+    return context;
   }
 
-  // normalizeDynamicData guarantees DYNAMIC context always exposes an object payload.
-  private static normalizeDynamicData(data: unknown): Record<string, unknown> {
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      return data as Record<string, unknown>;
+  private async findTagsForItem(itemId: number): Promise<string[]> {
+    const itemTags = await ChatbotItemTagModel.findAll({
+      where: { item_id: itemId },
+      include: [{ model: TagModel, as: 'tag' }]
+    });
+
+    return itemTags
+      .map((row) => (row.get('tag') as TagModel | undefined)?.tag_code)
+      .filter((tagCode): tagCode is string => typeof tagCode === 'string');
+  }
+
+  private async hydrateContextEntity(entityId: number, entity: BbEntityModel, tags: string[]): Promise<ContextItem | null> {
+    if (entity.entity_type === 'CONTACT') {
+      const contact = await BbContactModel.findByPk(entityId);
+      if (!contact) return null;
+
+      return {
+        entityId,
+        entityType: 'CONTACT',
+        tags,
+        payload: {
+          org_name: contact.org_name,
+          phone: contact.phone,
+          email: contact.email,
+          address_text: contact.address_text,
+          city: contact.city,
+          country: contact.country,
+          hours_text: contact.hours_text
+        }
+      };
     }
 
-    return {};
+    if (entity.entity_type === 'SCHEDULE') {
+      const schedule = await BbScheduleModel.findByPk(entityId);
+      if (!schedule) return null;
+
+      return {
+        entityId,
+        entityType: 'SCHEDULE',
+        tags,
+        payload: {
+          title: schedule.title,
+          day_of_week: schedule.day_of_week,
+          open_time: schedule.open_time,
+          close_time: schedule.close_time,
+          notes: schedule.notes
+        }
+      };
+    }
+
+    if (entity.type_id) {
+      const dynamicType = await BlockTypeModel.findOne({
+        where: {
+          type_id: entity.type_id,
+          [Op.or]: [{ chatbot_id: null }, { chatbot_id: { [Op.ne]: null } }]
+        }
+      });
+
+      return {
+        entityId,
+        entityType: dynamicType ? `DYNAMIC:${dynamicType.type_name}` : 'DYNAMIC',
+        tags,
+        payload: (entity.data ?? {}) as Record<string, unknown>
+      };
+    }
+
+    return null;
+  }
+
+  private composeAnswer(
+    chatbotName: string,
+    message: string,
+    history: Array<{ role: 'user' | 'assistant'; content: string }>,
+    contextItems: ContextItem[]
+  ): string {
+    if (contextItems.length === 0) {
+      return `I could not find configured knowledge for ${chatbotName} yet. Please ask the owner to add contact, schedules, or custom block data.`;
+    }
+
+    const lastTurns = history.slice(-10).map((entry) => `${entry.role}: ${entry.content}`).join(' | ');
+    const condensedContext = contextItems
+      .slice(0, 6)
+      .map((item) => `${item.entityType} ${JSON.stringify(item.payload)}`)
+      .join(' ; ');
+
+    return `Based on ${chatbotName} data, here is the best answer to "${message}": ${condensedContext}.${
+      lastTurns ? ` Previous conversation (for continuity only): ${lastTurns}` : ''
+    }`;
   }
 }
